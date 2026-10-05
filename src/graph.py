@@ -54,9 +54,29 @@ def normalize_crime(name: str) -> str:
 
 def link_entity(name: str, known: list[str], normalize: Callable[[str], str] = normalize_crime) -> str | None:
     """Map a free-text mention (e.g. a charge written by a journalist) onto one canonical name in `known`."""
-    # TODO KG-1: normalize both sides, exact match first, then difflib.get_close_matches(cutoff=0.8).
-    #            Return the ORIGINAL spelling from `known`; return None when nothing is close enough.
-    raise NotImplementedError("TODO KG-1 link_entity (src/graph.py) - kiểm tra: pytest tests/test_graph.py -k LinkEntity")
+    # Keep the original value from ``known`` as it is the canonical graph value;
+    # normalised values are only used for matching.
+    if not name or not known:
+        return None
+
+    mention = normalize(name)
+    if not mention:
+        return None
+
+    normalised_to_original: dict[str, str] = {}
+    for candidate in known:
+        if not candidate:
+            continue
+        normalised = normalize(candidate)
+        if not normalised:
+            continue
+        normalised_to_original.setdefault(normalised, candidate)
+
+    if mention in normalised_to_original:
+        return normalised_to_original[mention]
+
+    matches = difflib.get_close_matches(mention, list(normalised_to_original), n=1, cutoff=0.8)
+    return normalised_to_original[matches[0]] if matches else None
 
 def find_substances(text: str) -> list[str]:
     lowered = text.lower()
@@ -262,18 +282,101 @@ class Neo4jGraph:
         #   c. Articles named in the question ("Điều 251" -> re.findall(r"[Đđ]iều (\d+)", question)):
         #      clause 1 + clauses mentioning find_substances(question)
         #   d. One fact per clause: f"[{article_id} - {title}] khoản {number}: {text}"
-        raise NotImplementedError("TODO KG-3 Neo4jGraph.context (src/graph.py) - kiểm tra: python bench_kg.py --check")
+        seed_ids, facts = self.seed_facts(question, doc_ids, limit=max_facts)
+
+        # A seed may be a Case itself (from its document id), a Person named in
+        # the question, or a Substance mentioned by it.  Resolve all such seeds
+        # to the affected cases before crossing the Crime bridge to the law KB.
+        case_rows = self.run(
+            """
+            MATCH (k:Case)
+            WHERE elementId(k) IN $ids
+               OR EXISTS { MATCH (s)--(k) WHERE elementId(s) IN $ids }
+            RETURN DISTINCT elementId(k) AS id, k.name AS name, k.summary AS summary
+            """,
+            ids=seed_ids,
+        )
+        case_ids = [row["id"] for row in case_rows]
+        for row in case_rows:
+            summary = (row.get("summary") or "").strip()
+            facts.append(f"Vụ việc '{row['name']}': {summary}" if summary else f"Vụ việc '{row['name']}'")
+
+        # Cross from news to law through the canonical Crime node.  Clause 1 is
+        # always useful as the basic penalty; substance-specific clauses add the
+        # relevant higher threshold when a case records that substance.
+        clause_rows: list[dict] = []
+        if case_ids:
+            clause_rows.extend(self.run(
+                """
+                MATCH (k:Case)-[:CHARGED_WITH]->(:Crime)<-[:DEFINES]-(a:Article)-[:HAS_CLAUSE]->(cl:Clause)
+                WHERE elementId(k) IN $case_ids
+                  AND (cl.number = 1
+                       OR EXISTS { MATCH (k)-[:INVOLVES]->(:Substance)<-[:MENTIONS]-(cl) })
+                RETURN DISTINCT a.id AS article_id, a.title AS title, cl.number AS number, cl.text AS text
+                ORDER BY article_id, number
+                """,
+                case_ids=case_ids,
+            ))
+
+        # Questions that name an article should work even with no news-case
+        # seed.  Limit these to the basic clause plus clauses about substances
+        # explicitly named by the user, so the prompt stays focused.
+        article_numbers = re.findall(r"[Đđ]iều\s+(\d+)", question)
+        question_substances = find_substances(question)
+        if article_numbers:
+            clause_rows.extend(self.run(
+                """
+                MATCH (a:Article)-[:HAS_CLAUSE]->(cl:Clause)
+                WHERE split(a.id, ' ')[1] IN $article_numbers
+                  AND (cl.number = 1
+                       OR (size($substances) > 0
+                           AND EXISTS {
+                               MATCH (cl)-[:MENTIONS]->(s:Substance)
+                               WHERE s.name IN $substances
+                           }))
+                RETURN DISTINCT a.id AS article_id, a.title AS title, cl.number AS number, cl.text AS text
+                ORDER BY article_id, number
+                """,
+                article_numbers=article_numbers,
+                substances=question_substances,
+            ))
+
+        seen_clauses: set[tuple[Any, Any]] = set()
+        for row in clause_rows:
+            key = (row["article_id"], row["number"])
+            if key in seen_clauses:
+                continue
+            seen_clauses.add(key)
+            facts.append(f"[{row['article_id']} - {row['title']}] khoản {row['number']}: {row['text']}")
+
+        # seed_facts is capped, but additions above are not.  Keep the public
+        # contract's maximum so graph context cannot make an unbounded prompt.
+        return facts[:max_facts]
 
 # ---------------------------------------------------------------------------------------------- KG-2
 
 def build_graph(graph: Neo4jGraph, law_docs: list[Document], news_docs: list[Document],
                 llm_fn: Callable[..., str]) -> None:
     """Load both KBs into an empty graph. llm_fn(prompt, json_mode=False) -> str (metered OpenAI chat)."""
-    # TODO KG-2: create YOUR ontology in Neo4j from both KBs.
-    #   Contract: every node created from one document has the property doc_id = Document.id.
-    #   Fastest start: the HINT helpers above (parse_law_article, extract_news_cases, suggested_constraints,
-    #   add_law_article, add_news_case). Own ontology + report/ONTOLOGY.md = bonus (SUBMISSION.md).
-    raise NotImplementedError("TODO KG-2 build_graph (src/graph.py) - kiểm tra: python bench_kg.py --build --limit 2")
+    # Law articles are regular enough to extract deterministically.  The helpers
+    # attach each Article and Clause to its source ``doc_id``.
+    graph.suggested_constraints()
+    articles = [parse_law_article(doc) for doc in law_docs]
+    for article in articles:
+        graph.add_law_article(article)
+
+    # Crime is the shared bridge between the law and news knowledge bases.  Give
+    # the LLM canonical crime names and ask it for JSON, then re-link each value
+    # in extract_news_cases before persisting the result.
+    known_crimes = [article["crime"] for article in articles if article["crime"]]
+    for doc in news_docs:
+        cases = extract_news_cases(
+            doc,
+            lambda prompt: llm_fn(prompt, json_mode=True),
+            known_crimes,
+        )
+        for case in cases:
+            graph.add_news_case(case, doc)
 
 # ---------------------------------------------------------------------------------------------- KG-4
 
@@ -300,4 +403,17 @@ class GraphRAGAgent:
     def answer(self, question: str, top_k: int = 3) -> str:
         # TODO KG-4: vector top-k (same as flat RAG) -> doc_ids of the hits -> self.graph.context(question, doc_ids)
         #            -> fill GRAPH_PROMPT -> self.llm_fn(prompt)
-        raise NotImplementedError("TODO KG-4 GraphRAGAgent.answer (src/graph.py) - kiểm tra: pytest tests/test_graph.py -k GraphRAGAgent")
+        chunks = self.store.search(question, top_k=top_k)
+        doc_ids = list(dict.fromkeys(
+            chunk["metadata"].get("doc_id")
+            for chunk in chunks
+            if chunk.get("metadata", {}).get("doc_id")
+        ))
+        facts = self.graph.context(question, doc_ids)
+
+        facts_context = "\n".join(f"- {fact}" for fact in facts) or "- Không có dữ kiện graph liên quan."
+        chunks_context = "\n\n".join(
+            f"[{index}] {chunk['content']}" for index, chunk in enumerate(chunks, start=1)
+        ) or "Không có đoạn văn bản truy xuất được."
+        prompt = GRAPH_PROMPT.format(facts=facts_context, chunks=chunks_context, question=question)
+        return self.llm_fn(prompt)
